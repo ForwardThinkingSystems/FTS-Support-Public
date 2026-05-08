@@ -434,7 +434,7 @@ If your hierarchy exceeds 32 sub-companies, this path returns `400`:
 ```json
 {
   "errorCode": 400,
-  "errorMessage": "Multi-company query exceeds the synchronous limit of 32 sub-companies (resolved scope: 3098). Narrow with ?companyId=<companyId>; use GET /companies to list accessible companies.",
+  "errorMessage": "Multi-company query exceeds the synchronous limit of 32 sub-companies (resolved scope: 150). Narrow with ?companyId=<companyId>; use GET /companies to list accessible companies.",
   "traceId": "..."
 }
 ```

@@ -1,12 +1,17 @@
 # FleetCam REST API — Integration Guide
 
-For developers integrating with the FleetCam REST API. Covers authentication, the two account types (single-company customers and resellers), common workflows, and complete copy-paste code samples in Python and C#.
+For developers integrating with the FleetCam REST API. Covers authentication, the two account types (single-company customers and resellers), common workflows, and copy-paste code samples in **Python, C#, JavaScript (Node 18+ / browser), and React**.
 
 > **Looking for the full reference?** The OpenAPI spec is at `https://<host>/fc-rest/v1/v3/api-docs` (JSON) and `/swagger-ui.html` (interactive). This guide explains the concepts and patterns; the spec is the authoritative endpoint catalog.
+
+> **Code samples are collapsible — click a language heading below to expand it.** Default state is collapsed so you can pick the stack you care about without scrolling past the others.
 
 ---
 
 ## 1. Quick start
+
+<details>
+<summary><b>Python</b></summary>
 
 ```python
 import requests
@@ -25,6 +30,34 @@ r = requests.get(f"{BASE}/vehicles?pageSize=10&pageNumber=1", headers=headers)
 r.raise_for_status()
 print(r.json()["vehicles"])
 ```
+
+</details>
+
+<details>
+<summary><b>JavaScript (Node 18+ / browser)</b></summary>
+
+```javascript
+const BASE = "https://<your-fleetcam-host>/fc-rest/v1";
+
+// 1. Get a bearer token
+const auth = await fetch(`${BASE}/authentication/token`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ userName: "your-username", password: "your-password" }),
+});
+if (!auth.ok) throw new Error(`auth failed: ${auth.status}`);
+const { accessToken } = await auth.json();
+
+// 2. Call any endpoint with the token
+const r = await fetch(`${BASE}/vehicles?pageSize=10&pageNumber=1`, {
+  headers: { Authorization: `Bearer ${accessToken}` },
+});
+if (!r.ok) throw new Error(`vehicles failed: ${r.status}`);
+const { vehicles } = await r.json();
+console.log(vehicles);
+```
+
+</details>
 
 Tokens are JWTs with a finite lifetime (usually 1 hour). Re-authenticate before they expire — see [Token caching](#5-token-caching) for the recommended pattern.
 
@@ -117,7 +150,9 @@ List endpoints (`/vehicles`, `/groups`, `/events`, etc.) take `pageNumber` (1-ba
 Iterate while `hasMoreData == true`.
 
 ### `companyId` field on every response row
-Every event/vehicle/group row carries a `companyId` field naming the sub-company that owns it. For single-company customers it's always your own id. For resellers fetching per-sub-co, it matches the sub you queried. For resellers using cross-company aggregation, it tags each row with its source sub-co — useful for grouping in reports.
+Every top-level row in `events[]`, `vehicles[]`, and `groups[]` (including nested group children) carries a `companyId` field naming the sub-company that owns it. For single-company customers it's always your own id. For resellers fetching per-sub-co, it matches the sub you queried. For resellers using cross-company aggregation, it tags each row with its source sub-co — useful for grouping in reports.
+
+(Sub-objects nested inside a vehicle row — e.g. `dvr.cameras[]`, the vehicle's `groups[]` membership list — don't carry their own `companyId`; they inherit it from the parent vehicle.)
 
 ### Error envelope
 Every error response (4xx + 5xx) uses this shape:
@@ -133,7 +168,7 @@ Every error response (4xx + 5xx) uses this shape:
 **Always log the `traceId`.** Send it to support if you need to debug a server-side issue — it ties directly to server logs.
 
 ### Time formats
-All dates are ISO-8601 in UTC: `2026-05-08T10:30:00Z`. Don't send timezones other than `Z`.
+All dates are ISO-8601. **Recommended: UTC with the `Z` suffix** — `2026-05-08T10:30:00Z`. The server accepts other offsets (`2026-05-08T06:30:00-04:00`) and will normalize internally, but UTC keeps your client logs and our server logs aligned to the same wall clock and avoids subtle bugs around DST transitions.
 
 ---
 
@@ -141,7 +176,9 @@ All dates are ISO-8601 in UTC: `2026-05-08T10:30:00Z`. Don't send timezones othe
 
 Don't authenticate on every call. Cache the token until it's about to expire, then re-authenticate. A simple pattern:
 
-**Python:**
+<details>
+<summary><b>Python</b></summary>
+
 ```python
 import time, threading, requests
 
@@ -176,7 +213,11 @@ class FleetCamClient:
                                 headers=headers, timeout=30, **kwargs)
 ```
 
-**C#:**
+</details>
+
+<details>
+<summary><b>C#</b></summary>
+
 ```csharp
 using System.Net.Http.Json;
 
@@ -229,13 +270,215 @@ public class FleetCamClient
 }
 ```
 
+</details>
+
+<details>
+<summary><b>JavaScript (Node 18+ / browser)</b></summary>
+
+```javascript
+class FleetCamClient {
+  constructor(baseUrl, username, password) {
+    this.baseUrl = baseUrl.replace(/\/$/, "");
+    this.username = username;
+    this.password = password;
+    this._token = null;
+    this._tokenExpiresAt = 0;
+    this._refreshPromise = null;
+  }
+
+  async _getToken() {
+    // 30s safety margin so we don't race expiry mid-request
+    if (this._token && Date.now() < this._tokenExpiresAt - 30_000) {
+      return this._token;
+    }
+    // De-dupe concurrent refresh attempts
+    if (this._refreshPromise) return this._refreshPromise;
+
+    this._refreshPromise = (async () => {
+      const r = await fetch(`${this.baseUrl}/authentication/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userName: this.username, password: this.password }),
+      });
+      if (!r.ok) throw new Error(`auth failed: HTTP ${r.status}`);
+      const body = await r.json();
+      this._token = body.accessToken;
+      this._tokenExpiresAt = Date.now() + (body.expiresInSeconds ?? 3600) * 1000;
+      return this._token;
+    })();
+    try { return await this._refreshPromise; }
+    finally { this._refreshPromise = null; }
+  }
+
+  async request(method, path, { body, headers = {}, signal, ...rest } = {}) {
+    const token = await this._getToken();
+    const init = {
+      method,
+      headers: {
+        ...headers,
+        Authorization: `Bearer ${token}`,
+        ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+      },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      ...(signal ? { signal } : {}),
+      ...rest,
+    };
+    return fetch(`${this.baseUrl}${path}`, init);
+  }
+}
+
+// Reusable error builder — used by every JS workflow sample below.
+// Returns an Error with .status, .traceId, and .errorCode attached.
+export async function toApiError(resp) {
+  let envelope = null;
+  try { envelope = await resp.json(); } catch { /* non-JSON body */ }
+  const message = envelope?.errorMessage ?? `HTTP ${resp.status}`;
+  const traceId = envelope?.traceId ?? "n/a";
+  const err = new Error(`HTTP ${resp.status}: ${message} (traceId=${traceId})`);
+  err.status = resp.status;
+  err.traceId = traceId;
+  err.errorCode = envelope?.errorCode;
+  return err;
+}
+```
+
+> **JavaScript samples below assume `FleetCamClient` and `toApiError` from the block above.** Expand §5 first if you're skipping around.
+
+</details>
+
+### 5.1 React integration
+
+For React apps, wrap the client in a Context so every component can call the API without holding its own credentials. Pattern:
+
+1. **`FleetCamProvider`** owns the singleton client and exposes it via Context.
+2. **`useFleetCam()`** hook returns the client — components call it from event handlers / effects.
+3. Custom data hooks like **`useVehicles()`** wrap a single endpoint call with loading + error state.
+
+> **Production note.** Don't hard-code the password into a browser bundle. Front the API behind your own backend that performs the FleetCam auth and proxies requests, OR use a short-lived service token retrieved from your backend on app load. The samples below assume a Node-side client or a trusted environment.
+
+<details>
+<summary><b>React — Provider + base hook</b></summary>
+
+```jsx
+import { createContext, useContext, useMemo } from "react";
+
+const FleetCamContext = createContext(null);
+
+export function FleetCamProvider({ baseUrl, username, password, children }) {
+  // Memoize so the client is created once per provider mount.
+  const client = useMemo(
+    () => new FleetCamClient(baseUrl, username, password),
+    [baseUrl, username, password],
+  );
+  return <FleetCamContext.Provider value={client}>{children}</FleetCamContext.Provider>;
+}
+
+export function useFleetCam() {
+  const client = useContext(FleetCamContext);
+  if (!client) throw new Error("useFleetCam must be used inside <FleetCamProvider>");
+  return client;
+}
+```
+
+</details>
+
+<details>
+<summary><b>React — wiring at the app root</b></summary>
+
+```jsx
+// App.jsx — LOCAL DEV ONLY.
+// In production, do NOT ship credentials in the browser bundle. Vite's
+// VITE_* env vars are inlined into the client bundle and visible to anyone
+// who opens DevTools. Use a backend proxy (your server performs the FleetCam
+// auth and forwards the request) or a short-lived service token fetched from
+// your backend on app load. See the Production note above.
+function App() {
+  return (
+    <FleetCamProvider
+      baseUrl={import.meta.env.VITE_FLEETCAM_BASE_URL}
+      username={import.meta.env.VITE_FLEETCAM_USERNAME}
+      password={import.meta.env.VITE_FLEETCAM_PASSWORD}  // ⚠ dev only — leaks to client bundle
+    >
+      <Dashboard />
+    </FleetCamProvider>
+  );
+}
+```
+
+</details>
+
+<details>
+<summary><b>React — custom data hook with loading + error state</b></summary>
+
+```jsx
+import { useEffect, useState } from "react";
+// toApiError comes from the FleetCamClient block in §5.
+
+export function useVehicles({ pageNumber = 1, pageSize = 100 } = {}) {
+  const client = useFleetCam();
+  const [state, setState] = useState({ data: null, loading: true, error: null });
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setState({ data: null, loading: true, error: null });
+    client
+      .request(
+        "GET",
+        `/vehicles?pageSize=${pageSize}&pageNumber=${pageNumber}`,
+        { signal: controller.signal },
+      )
+      .then(async (r) => {
+        if (!r.ok) throw await toApiError(r);
+        return r.json();
+      })
+      .then((body) => setState({ data: body, loading: false, error: null }))
+      .catch((err) => {
+        // Aborted on unmount or prop change — silently ignore; a fresh
+        // request was kicked off (or the component is gone).
+        if (err.name === "AbortError") return;
+        setState({ data: null, loading: false, error: err });
+      });
+    // Cleanup: actually abort the in-flight fetch, not just gate state updates.
+    return () => controller.abort();
+  }, [client, pageNumber, pageSize]);
+
+  return state;
+}
+```
+
+</details>
+
+<details>
+<summary><b>React — using the hook in a component</b></summary>
+
+```jsx
+function VehicleList() {
+  const { data, loading, error } = useVehicles({ pageSize: 50 });
+
+  if (loading) return <div>Loading...</div>;
+  if (error)   return <div>Error: {error.message} (traceId: {error.traceId})</div>;
+
+  return (
+    <ul>
+      {data.vehicles.map((v) => (
+        <li key={v.vehicleId}>{v.vehicleName} (company {v.companyId})</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+</details>
+
 ---
 
 ## 6. Common workflows
 
 ### 6.1 List vehicles
 
-**Python:**
+<details>
+<summary><b>Python</b></summary>
+
 ```python
 client = FleetCamClient(BASE, "user", "pass")
 
@@ -255,7 +498,11 @@ while body["hasMoreData"]:
         print(vehicle["vehicleId"], vehicle["vehicleName"])
 ```
 
-**C#:**
+</details>
+
+<details>
+<summary><b>C#</b></summary>
+
 ```csharp
 var resp = await client.RequestAsync(HttpMethod.Get, "vehicles?pageSize=100&pageNumber=1");
 resp.EnsureSuccessStatusCode();
@@ -281,9 +528,39 @@ public record VehiclesResponse(
     int TotalPages, bool HasMoreData);
 ```
 
+</details>
+
+<details>
+<summary><b>JavaScript</b></summary>
+
+```javascript
+const client = new FleetCamClient(BASE, "user", "pass");
+
+let resp = await client.request("GET", "/vehicles?pageSize=100&pageNumber=1");
+if (!resp.ok) throw await toApiError(resp);
+let body = await resp.json();
+for (const v of body.vehicles) {
+  console.log(v.vehicleId, v.vehicleName, "->", v.companyId);
+}
+
+while (body.hasMoreData) {
+  const next = body.currentPageNumber + 1;
+  resp = await client.request("GET", `/vehicles?pageSize=100&pageNumber=${next}`);
+  if (!resp.ok) throw await toApiError(resp);
+  body = await resp.json();
+  for (const v of body.vehicles) {
+    console.log(v.vehicleId, v.vehicleName);
+  }
+}
+```
+
+</details>
+
 ### 6.2 Search events for a time window
 
-**Python:**
+<details>
+<summary><b>Python</b></summary>
+
 ```python
 from datetime import datetime, timedelta, timezone
 
@@ -301,8 +578,36 @@ for e in events:
     print(e["eventId"], e["eventDate"], "company=", e["companyId"])
 ```
 
+</details>
+
+<details>
+<summary><b>JavaScript</b></summary>
+
+```javascript
+const end = new Date();
+end.setMilliseconds(0);
+const start = new Date(end.getTime() - 24 * 60 * 60 * 1000);
+
+const resp = await client.request("POST", "/events?pageSize=500&pageNumber=1", {
+  body: {
+    startDate: start.toISOString().replace(".000Z", "Z"),
+    endDate:   end.toISOString().replace(".000Z", "Z"),
+  },
+});
+if (!resp.ok) throw await toApiError(resp);
+const { events } = await resp.json();
+for (const e of events) {
+  console.log(e.eventId, e.eventDate, "company=", e.companyId);
+}
+```
+
+</details>
+
 ### 6.3 Quick "last N minutes" event lookup
 For dashboard-style "what happened recently?" queries, the `minutes` shorthand avoids client-side date math:
+
+<details>
+<summary><b>Python</b></summary>
 
 ```python
 r = client.request("POST", "/events?pageSize=500&pageNumber=1",
@@ -311,12 +616,30 @@ r.raise_for_status()
 events = r.json()["events"]
 ```
 
+</details>
+
+<details>
+<summary><b>JavaScript</b></summary>
+
+```javascript
+const resp = await client.request("POST", "/events?pageSize=500&pageNumber=1", {
+  body: { minutes: 60 },  // last 60 minutes, server-computed UTC
+});
+if (!resp.ok) throw await toApiError(resp);
+const { events } = await resp.json();
+```
+
+</details>
+
 Constraints:
 - `minutes` is **mutually exclusive** with `startDate`/`endDate`. Pass one or the other, not both.
 - `minutes` produces a sliding window relative to "now," so it's only valid with `pageNumber=1`. For paged reads, use explicit dates.
 - Range: `1` to `10080` (7 days).
 
 ### 6.4 Get a single event's details
+
+<details>
+<summary><b>Python</b></summary>
 
 ```python
 event_id = 12345
@@ -332,11 +655,35 @@ r.raise_for_status()
 video_urls = r.json()
 ```
 
+</details>
+
+<details>
+<summary><b>JavaScript</b></summary>
+
+```javascript
+const eventId = 12345;
+
+// Vehicle telemetry around the event
+let resp = await client.request("GET", `/events/logs/${eventId}`);
+if (!resp.ok) throw await toApiError(resp);
+const logs = await resp.json();
+
+// Pre-signed video URLs
+resp = await client.request("GET", `/events/${eventId}/urls`);
+if (!resp.ok) throw await toApiError(resp);
+const videoUrls = await resp.json();
+```
+
+</details>
+
 ---
 
 ## 7. Reseller workflow
 
 ### 7.1 Discover your sub-companies
+
+<details>
+<summary><b>Python</b></summary>
 
 ```python
 r = client.request("GET", "/companies?pageSize=500&pageNumber=1")
@@ -345,12 +692,31 @@ sub_companies = [c["companyId"] for c in r.json().get("content", [])]
 print(f"You have {len(sub_companies)} sub-companies in your hierarchy.")
 ```
 
+</details>
+
+<details>
+<summary><b>JavaScript</b></summary>
+
+```javascript
+const resp = await client.request("GET", "/companies?pageSize=500&pageNumber=1");
+if (!resp.ok) throw await toApiError(resp);
+const body = await resp.json();
+const subCompanies = (body.content ?? []).map((c) => c.companyId);
+console.log(`You have ${subCompanies.length} sub-companies in your hierarchy.`);
+```
+
+</details>
+
 ### 7.2 Per-sub-company iteration (recommended pattern)
 
 This is how every reseller integration should look. It scales to any hierarchy size.
 
-**Python:**
+<details>
+<summary><b>Python</b></summary>
+
 ```python
+from datetime import datetime, timedelta, timezone
+
 def get_recent_events_for_sub(client, sub_company_id, hours=24):
     end = datetime.now(timezone.utc).replace(microsecond=0)
     start = end - timedelta(hours=hours)
@@ -376,7 +742,11 @@ for sub_id in sub_companies:
     print(f"  sub {sub_id}: {len(events)} events")
 ```
 
-**C#:**
+</details>
+
+<details>
+<summary><b>C#</b></summary>
+
 ```csharp
 async Task<List<Event>> GetRecentEventsForSubAsync(
     FleetCamClient client, long subCompanyId, int hours = 24, CancellationToken ct = default)
@@ -405,16 +775,64 @@ async Task<List<Event>> GetRecentEventsForSubAsync(
 }
 
 public record Event(long EventId, long VehicleId, long CompanyId,
-                    DateTimeOffset EventDate, int EventTypeId /* ... */);
-public record EventsResponse(List<Event> Events, bool HasMoreData /* ... pagination fields ... */);
+                    DateTimeOffset EventDate, int EventTypeId /* + lat/lon/hasVideo/etc. — see /v3/api-docs */);
+public record EventsResponse(
+    List<Event> Events,
+    int CurrentPageNumber, int CurrentPageSize,
+    int RequestedPageNumber, int RequestedPageSize,
+    int TotalPages, bool HasMoreData);
 ```
+
+</details>
+
+<details>
+<summary><b>JavaScript</b></summary>
+
+```javascript
+async function getRecentEventsForSub(client, subCompanyId, hours = 24) {
+  const end = new Date();
+  end.setMilliseconds(0);
+  const start = new Date(end.getTime() - hours * 60 * 60 * 1000);
+  const all = [];
+  let page = 1;
+  while (true) {
+    const resp = await client.request(
+      "POST",
+      `/events?pageSize=500&pageNumber=${page}&companyId=${subCompanyId}`,
+      {
+        body: {
+          startDate: start.toISOString().replace(".000Z", "Z"),
+          endDate:   end.toISOString().replace(".000Z", "Z"),
+        },
+      },
+    );
+    if (!resp.ok) throw await toApiError(resp);
+    const body = await resp.json();
+    all.push(...body.events);
+    if (!body.hasMoreData) break;
+    page += 1;
+  }
+  return all;
+}
+
+// Iterate every sub-company
+for (const subId of subCompanies) {
+  const events = await getRecentEventsForSub(client, subId, 24);
+  console.log(`  sub ${subId}: ${events.length} events`);
+}
+```
+
+</details>
 
 ### 7.3 Cross-company aggregation (only for hierarchies ≤ 32 sub-cos)
 
 If you have a small hierarchy and want a single response across all your sub-cos:
 
+<details>
+<summary><b>Python</b></summary>
+
 ```python
-# Multi-scope query — server fans out across your hierarchy
+# Multi-scope query — server aggregates across your hierarchy
 r = client.request("POST", "/events?pageSize=500&pageNumber=1",
                    json={"minutes": 60})  # required: a time bound
 # Each event in the response carries a `companyId` so you can group them
@@ -429,13 +847,36 @@ r = client.request("POST", "/events?pageSize=500&pageNumber=1",
                    })
 ```
 
+</details>
+
+<details>
+<summary><b>JavaScript</b></summary>
+
+```javascript
+// Multi-scope query — server aggregates across your hierarchy
+const resp = await client.request("POST", "/events?pageSize=500&pageNumber=1", {
+  body: { minutes: 60 },  // required: a time bound
+});
+if (!resp.ok) throw await toApiError(resp);
+const { events } = await resp.json();
+// Each event carries a `companyId` so you can group them:
+const grouped = events.reduce((acc, e) => {
+  (acc[e.companyId] ??= []).push(e);
+  return acc;
+}, {});
+```
+
+</details>
+
 If your hierarchy exceeds 32 sub-companies, this path returns `400`:
 
 ```json
 {
   "errorCode": 400,
   "errorMessage": "Multi-company query exceeds the synchronous limit of 32 sub-companies (resolved scope: 150). Narrow with ?companyId=<companyId>; use GET /companies to list accessible companies.",
-  "traceId": "..."
+  "errorDetails": null,
+  "requestUrl": "/fc-rest/v1/events",
+  "traceId": "9d691e9c-0a08-43d5-863d-0fcea7b5b513"
 }
 ```
 
@@ -447,7 +888,9 @@ When you see this, switch to the per-sub-company iteration in 7.2.
 
 Every error response uses the same envelope. Implement a single error handler that pulls `errorMessage` for user display and `traceId` for support tickets.
 
-**Python:**
+<details>
+<summary><b>Python</b></summary>
+
 ```python
 import requests
 
@@ -463,7 +906,11 @@ def handle_response(r):
     raise RuntimeError(f"HTTP {r.status_code}: {msg} (traceId={trace})")
 ```
 
-**C#:**
+</details>
+
+<details>
+<summary><b>C#</b></summary>
+
 ```csharp
 public static async Task<T> HandleAsync<T>(HttpResponseMessage resp, CancellationToken ct = default)
 {
@@ -482,18 +929,50 @@ public record ErrorResponse(int ErrorCode, string ErrorMessage, string? ErrorDet
                             string? RequestUrl, string TraceId);
 ```
 
+</details>
+
+<details>
+<summary><b>JavaScript</b></summary>
+
+```javascript
+// toApiError — referenced from the React useVehicles hook in §5.1 and the
+// JS workflow samples above. Returns an Error with status + traceId attached.
+export async function toApiError(resp) {
+  let envelope = null;
+  try { envelope = await resp.json(); } catch { /* non-JSON body */ }
+  const message = envelope?.errorMessage ?? `HTTP ${resp.status}`;
+  const traceId = envelope?.traceId ?? "n/a";
+  const err = new Error(`HTTP ${resp.status}: ${message} (traceId=${traceId})`);
+  err.status = resp.status;
+  err.traceId = traceId;
+  err.errorCode = envelope?.errorCode;
+  return err;
+}
+
+// Wrapper that throws on non-2xx — drop-in for fetch responses.
+export async function handleResponse(resp) {
+  if (resp.ok) return resp.json();
+  throw await toApiError(resp);
+}
+
+// Usage:
+//   const body = await handleResponse(await client.request("GET", "/vehicles"));
+```
+
+</details>
+
 ### Status code reference
 
 | Status | Meaning | Likely cause | What to do |
 |---|---|---|---|
 | `400` | Bad request | Validation failure: malformed JSON, missing required field, invalid date, too-wide window, multi-company cap exceeded | Fix the request per `errorMessage` |
 | `401` | Unauthenticated | Bad creds, expired token, no token | Re-authenticate |
-| `403` | Forbidden | Caller lacks the role; or `?companyId=` is outside caller's hierarchy | Verify role assignment / sub-co ownership |
-| `404` | Not found | Resource doesn't exist or isn't accessible to caller | Verify the id |
+| `403` | Forbidden | Caller lacks the role; or `?companyId=` is outside caller's hierarchy; or vehicle/event access denied | Verify role assignment / sub-co ownership |
+| `404` | Not found | Resource doesn't exist. Some endpoints (e.g. `GET /groups/{id}`) also use `404` to hide existence of resources outside the caller's company. For most endpoints, an inaccessible resource returns `403` instead — see the row above | Verify the id; if you expected access, check role + sub-co ownership |
 | `409` | Conflict | Resource in unexpected state (e.g. video paths missing) | Retry later or surface to user |
 | `429` | Rate limited | Too many requests | Back off and retry |
 | `500` | Internal error | Server-side bug | Capture `traceId` and contact support |
-| `503` | Temporarily overloaded | Server queue saturated under load (rare) | Retry with exponential backoff |
+| `503` | Temporarily overloaded | Either (a) the server's fan-out queue is saturated under load, or (b) the rate-limit subsystem failed open (fail-closed safety) | Retry with exponential backoff + jitter |
 
 ### Retry strategy
 - `503` and timeouts: **exponential backoff with jitter**, 3-5 attempts.
